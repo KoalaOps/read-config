@@ -1,5 +1,5 @@
 name: 'Read Skyhook Config'
-description: 'Reads service configuration from .skyhook/skyhook.yaml'
+description: 'Read service build/deploy config from a Skyhook YAML file (path, dockerfile, build context, deployment repo) by service name'
 author: 'KoalaOps'
 
 inputs:
@@ -8,7 +8,7 @@ inputs:
     required: false
     default: '.'
   service_name:
-    description: 'Name of the service to look up in the config'
+    description: 'Name of the service to look up in the config (must be non-empty)'
     required: true
   config_path:
     description: 'Path to the skyhook config file relative to working_directory'
@@ -49,30 +49,59 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install yq
+    - name: Install yq (v4)
       shell: bash
       run: |
-        if command -v yq &>/dev/null; then exit 0; fi
+        set -euo pipefail
+        # Accept preinstalled yq only if it is v4.x
+        if command -v yq &>/dev/null; then
+          if yq --version 2>&1 | grep -qE 'version v?4\.'; then
+            echo "Found preinstalled yq: $(yq --version)"
+            exit 0
+          fi
+          echo "::error::Found yq but not v4.x: $(yq --version 2>&1). Uninstall it or upgrade to v4."
+          exit 1
+        fi
+
         case "$(uname -s)-$(uname -m)" in
           Linux-x86_64)   ASSET=yq_linux_amd64 ;;
           Linux-aarch64)  ASSET=yq_linux_arm64 ;;
           Darwin-x86_64)  ASSET=yq_darwin_amd64 ;;
           Darwin-arm64)   ASSET=yq_darwin_arm64 ;;
-          *) echo "::error::yq not found and no prebuilt binary for $(uname -s)-$(uname -m). Install yq before using this action."; exit 1 ;;
+          *) echo "::error::yq not found and no prebuilt binary for $(uname -s)-$(uname -m). Install yq v4 before using this action."; exit 1 ;;
         esac
+
         SUDO=""
         [ "$(id -u)" -ne 0 ] && command -v sudo &>/dev/null && SUDO=sudo
         DEST=/usr/local/bin/yq
         URL="https://github.com/mikefarah/yq/releases/download/v4.47.1/${ASSET}"
         echo "Installing yq v4.47.1 from $URL"
-        if command -v curl &>/dev/null; then
-          $SUDO curl -fsSL -o "$DEST" "$URL"
-        elif command -v wget &>/dev/null; then
-          $SUDO wget -qO "$DEST" "$URL"
-        else
-          echo "::error::Neither curl nor wget is available; cannot install yq."; exit 1
-        fi
+
+        download() {
+          if command -v curl &>/dev/null; then
+            $SUDO curl -fsSL --retry 3 --retry-delay 2 -o "$DEST" "$URL"
+          elif command -v wget &>/dev/null; then
+            $SUDO wget -qO "$DEST" "$URL"
+          else
+            echo "::error::Neither curl nor wget is available; cannot install yq."
+            return 2
+          fi
+        }
+
+        for attempt in 1 2 3; do
+          if download; then
+            break
+          fi
+          rc=$?
+          if [ $rc -eq 2 ] || [ $attempt -eq 3 ]; then
+            echo "::error::yq download failed (attempt $attempt/3, exit $rc)"
+            exit 1
+          fi
+          sleep $((attempt * 2))
+        done
+
         $SUDO chmod +x "$DEST"
+        yq --version
 
     - name: Parse skyhook config
       id: parse
@@ -81,103 +110,8 @@ runs:
         WORKING_DIR: ${{ inputs.working_directory }}
         SERVICE_NAME: ${{ inputs.service_name }}
         CONFIG_PATH: ${{ inputs.config_path }}
-      run: |
-        CONFIG_FILE="${WORKING_DIR}/${CONFIG_PATH}"
-
-        # Check if config file exists
-        if [ ! -f "$CONFIG_FILE" ]; then
-          echo "Config file not found: $CONFIG_FILE"
-          echo "config_found=false" >> $GITHUB_OUTPUT
-          echo "service_found=false" >> $GITHUB_OUTPUT
-          # Set empty outputs for all fields
-          echo "name=" >> $GITHUB_OUTPUT
-          echo "path=" >> $GITHUB_OUTPUT
-          echo "deployment_repo=" >> $GITHUB_OUTPUT
-          echo "deployment_repo_path=" >> $GITHUB_OUTPUT
-          echo "build_context=" >> $GITHUB_OUTPUT
-          echo "dockerfile_path=" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        echo "config_found=true" >> $GITHUB_OUTPUT
-        echo "Found config file: $CONFIG_FILE"
-
-        # Find the service by name in the services array.
-        # Use strenv() to inject SERVICE_NAME via env, avoiding quote-injection
-        # if the name contains a literal `"`.
-        SERVICE_INDEX=$(SERVICE_NAME="$SERVICE_NAME" yq e '.services | to_entries | .[] | select(.value.name == strenv(SERVICE_NAME)) | .key' "$CONFIG_FILE" 2>/dev/null || echo "")
-
-        if [ -z "$SERVICE_INDEX" ]; then
-          echo "Service '$SERVICE_NAME' not found in config"
-          echo "service_found=false" >> $GITHUB_OUTPUT
-          # Set empty outputs
-          echo "name=" >> $GITHUB_OUTPUT
-          echo "path=" >> $GITHUB_OUTPUT
-          echo "deployment_repo=" >> $GITHUB_OUTPUT
-          echo "deployment_repo_path=" >> $GITHUB_OUTPUT
-          echo "build_context=" >> $GITHUB_OUTPUT
-          echo "dockerfile_path=" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        # Detect duplicate service names: yq returns a newline-separated list of
-        # indices when multiple matches exist. Treat that as a malformed config.
-        MATCH_COUNT=$(printf '%s\n' "$SERVICE_INDEX" | grep -c .)
-        if [ "$MATCH_COUNT" -gt 1 ]; then
-          echo "::error::Multiple services named '$SERVICE_NAME' found in $CONFIG_FILE (indices: $(echo "$SERVICE_INDEX" | tr '\n' ',' | sed 's/,$//'))"
-          exit 1
-        fi
-
-        if ! [[ "$SERVICE_INDEX" =~ ^[0-9]+$ ]]; then
-          echo "::error::Unexpected service index from yq: '$SERVICE_INDEX'"
-          exit 1
-        fi
-
-        echo "service_found=true" >> $GITHUB_OUTPUT
-        echo "Found service '$SERVICE_NAME' at index $SERVICE_INDEX"
-
-        # Extract service configuration
-        SERVICE_PATH=".services[$SERVICE_INDEX]"
-
-        # Get basic service fields
-        NAME=$(yq e "${SERVICE_PATH}.name // \"\"" "$CONFIG_FILE")
-        PATH_VALUE=$(yq e "${SERVICE_PATH}.path // \"\"" "$CONFIG_FILE")
-        DEPLOYMENT_REPO=$(yq e "${SERVICE_PATH}.deploymentRepo // \"\"" "$CONFIG_FILE")
-        DEPLOYMENT_REPO_PATH=$(yq e "${SERVICE_PATH}.deploymentRepoPath // \"\"" "$CONFIG_FILE")
-
-        # Get buildTool.docker configuration
-        BUILD_CONTEXT=$(yq e "${SERVICE_PATH}.buildTool.docker.buildContext // \"\"" "$CONFIG_FILE")
-        DOCKERFILE_PATH=$(yq e "${SERVICE_PATH}.buildTool.docker.dockerfilePath // \"\"" "$CONFIG_FILE")
-
-        # Handle "null" strings from yq
-        [ "$NAME" = "null" ] && NAME=""
-        [ "$PATH_VALUE" = "null" ] && PATH_VALUE=""
-        [ "$DEPLOYMENT_REPO" = "null" ] && DEPLOYMENT_REPO=""
-        [ "$DEPLOYMENT_REPO_PATH" = "null" ] && DEPLOYMENT_REPO_PATH=""
-        [ "$BUILD_CONTEXT" = "null" ] && BUILD_CONTEXT=""
-        [ "$DOCKERFILE_PATH" = "null" ] && DOCKERFILE_PATH=""
-
-        # Default build context to "." when absent
-        [ -z "$BUILD_CONTEXT" ] && BUILD_CONTEXT="."
-
-        # Output values
-        echo "name=${NAME}" >> $GITHUB_OUTPUT
-        echo "path=${PATH_VALUE}" >> $GITHUB_OUTPUT
-        echo "deployment_repo=${DEPLOYMENT_REPO}" >> $GITHUB_OUTPUT
-        echo "deployment_repo_path=${DEPLOYMENT_REPO_PATH}" >> $GITHUB_OUTPUT
-        echo "build_context=${BUILD_CONTEXT}" >> $GITHUB_OUTPUT
-        echo "dockerfile_path=${DOCKERFILE_PATH}" >> $GITHUB_OUTPUT
-
-        # Log outputs for debugging
-        echo "Parsed service configuration:"
-        echo "  name: ${NAME}"
-        echo "  path: ${PATH_VALUE}"
-        echo "  deployment_repo: ${DEPLOYMENT_REPO}"
-        echo "  deployment_repo_path: ${DEPLOYMENT_REPO_PATH}"
-        echo "  build_context: ${BUILD_CONTEXT}"
-        echo "  dockerfile_path: ${DOCKERFILE_PATH}"
+      run: bash "$GITHUB_ACTION_PATH/scripts/parse.sh"
 
 branding:
   icon: 'file-text'
   color: 'blue'
-

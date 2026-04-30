@@ -1,6 +1,8 @@
 # read-config
 
-A GitHub Action that reads service configuration from `.skyhook/skyhook.yaml`.
+[![test](https://github.com/KoalaOps/read-config/actions/workflows/test.yml/badge.svg)](https://github.com/KoalaOps/read-config/actions/workflows/test.yml)
+
+A GitHub Action that reads service configuration from `.skyhook/skyhook.yaml` and exposes the matching service's fields as step outputs.
 
 ## Description
 
