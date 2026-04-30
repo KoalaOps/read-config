@@ -1,6 +1,6 @@
 name: 'Read Skyhook Config'
 description: 'Reads service configuration from .skyhook/skyhook.yaml'
-author: 'Skyhook'
+author: 'KoalaOps'
 
 inputs:
   working_directory:
@@ -52,11 +52,27 @@ runs:
     - name: Install yq
       shell: bash
       run: |
-        if ! command -v yq &> /dev/null; then
-          echo "Installing yq..."
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+        if command -v yq &>/dev/null; then exit 0; fi
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)   ASSET=yq_linux_amd64 ;;
+          Linux-aarch64)  ASSET=yq_linux_arm64 ;;
+          Darwin-x86_64)  ASSET=yq_darwin_amd64 ;;
+          Darwin-arm64)   ASSET=yq_darwin_arm64 ;;
+          *) echo "::error::yq not found and no prebuilt binary for $(uname -s)-$(uname -m). Install yq before using this action."; exit 1 ;;
+        esac
+        SUDO=""
+        [ "$(id -u)" -ne 0 ] && command -v sudo &>/dev/null && SUDO=sudo
+        DEST=/usr/local/bin/yq
+        URL="https://github.com/mikefarah/yq/releases/download/v4.47.1/${ASSET}"
+        echo "Installing yq v4.47.1 from $URL"
+        if command -v curl &>/dev/null; then
+          $SUDO curl -fsSL -o "$DEST" "$URL"
+        elif command -v wget &>/dev/null; then
+          $SUDO wget -qO "$DEST" "$URL"
+        else
+          echo "::error::Neither curl nor wget is available; cannot install yq."; exit 1
         fi
+        $SUDO chmod +x "$DEST"
 
     - name: Parse skyhook config
       id: parse
@@ -86,9 +102,10 @@ runs:
         echo "config_found=true" >> $GITHUB_OUTPUT
         echo "Found config file: $CONFIG_FILE"
 
-        # Find the service by name in the services array
-        # Use yq to query the YAML
-        SERVICE_INDEX=$(yq e ".services | to_entries | .[] | select(.value.name == \"${SERVICE_NAME}\") | .key" "$CONFIG_FILE" 2>/dev/null || echo "")
+        # Find the service by name in the services array.
+        # Use strenv() to inject SERVICE_NAME via env, avoiding quote-injection
+        # if the name contains a literal `"`.
+        SERVICE_INDEX=$(SERVICE_NAME="$SERVICE_NAME" yq e '.services | to_entries | .[] | select(.value.name == strenv(SERVICE_NAME)) | .key' "$CONFIG_FILE" 2>/dev/null || echo "")
 
         if [ -z "$SERVICE_INDEX" ]; then
           echo "Service '$SERVICE_NAME' not found in config"
@@ -101,6 +118,19 @@ runs:
           echo "build_context=" >> $GITHUB_OUTPUT
           echo "dockerfile_path=" >> $GITHUB_OUTPUT
           exit 0
+        fi
+
+        # Detect duplicate service names: yq returns a newline-separated list of
+        # indices when multiple matches exist. Treat that as a malformed config.
+        MATCH_COUNT=$(printf '%s\n' "$SERVICE_INDEX" | grep -c .)
+        if [ "$MATCH_COUNT" -gt 1 ]; then
+          echo "::error::Multiple services named '$SERVICE_NAME' found in $CONFIG_FILE (indices: $(echo "$SERVICE_INDEX" | tr '\n' ',' | sed 's/,$//'))"
+          exit 1
+        fi
+
+        if ! [[ "$SERVICE_INDEX" =~ ^[0-9]+$ ]]; then
+          echo "::error::Unexpected service index from yq: '$SERVICE_INDEX'"
+          exit 1
         fi
 
         echo "service_found=true" >> $GITHUB_OUTPUT

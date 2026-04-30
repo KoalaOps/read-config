@@ -14,7 +14,7 @@ This action parses the Skyhook configuration file and extracts service-specific 
 ```yaml
 - name: Read service config
   id: config
-  uses: skyhook-io/read-config@v1
+  uses: KoalaOps/read-config@v1
   with:
     working_directory: code
     service_name: my-service
@@ -88,27 +88,41 @@ jobs:
 
       - name: Read service config
         id: config
-        uses: skyhook-io/read-config@v1
+        uses: KoalaOps/read-config@v1
         with:
           working_directory: code
           service_name: ${{ env.SERVICE_NAME }}
 
       - name: Build and push Docker image
-        uses: skyhook-io/docker-build-push-action@v1
+        uses: KoalaOps/docker-build-push-action@v1
         with:
           context: code/${{ steps.config.outputs.build_context }}
           dockerfile: code/${{ steps.config.outputs.dockerfile_path || format('{0}/Dockerfile', steps.config.outputs.build_context) }}
           image: ${{ inputs.image }}
 ```
 
-## Fallback Behavior
+## Behavior matrix
 
-If the config file doesn't exist or the service isn't found, all output values will be empty strings (except `build_context`, which always defaults to `.` when the service is found but `buildContext` is absent). When the service is missing entirely, fall back in the workflow:
+| Scenario | `config_found` | `service_found` | `build_context` | Other outputs |
+|---|---|---|---|---|
+| Config file missing | `false` | `false` | `""` | `""` |
+| Config found, service missing | `true` | `false` | `""` | `""` |
+| Service found, `buildContext` set | `true` | `true` | from config | from config |
+| Service found, `buildContext` absent | `true` | `true` | `"."` | from config |
+| Duplicate service names in config | n/a | n/a | n/a | action exits 1 |
+
+`build_context` defaults to `"."` only when the service is found and the field is absent. When the service or config itself is missing, `build_context` is empty - the workflow should decide whether to fall back or fail loudly:
 
 ```yaml
 context: ${{ steps.config.outputs.build_context || '.' }}
 dockerfile: ${{ steps.config.outputs.dockerfile_path || 'Dockerfile' }}
 ```
+
+## Runner requirements
+
+- Bash + `yq` v4.x. The action installs yq v4.47.1 if missing.
+- Auto-install supports `Linux-x86_64`, `Linux-aarch64`, `Darwin-x86_64`, `Darwin-arm64`. On other platforms (Windows, BSD, etc.), pre-install yq before this step or the action will fail with a clear error.
+- The auto-installer uses `curl` (preferred) or `wget`, and `sudo` if not running as root.
 
 ## License
 
