@@ -1,0 +1,153 @@
+name: 'Read Skyhook Config'
+description: 'Reads service configuration from .skyhook/skyhook.yaml'
+author: 'Skyhook'
+
+inputs:
+  working_directory:
+    description: 'Path to the repository root containing .skyhook/skyhook.yaml'
+    required: false
+    default: '.'
+  service_name:
+    description: 'Name of the service to look up in the config'
+    required: true
+  config_path:
+    description: 'Path to the skyhook config file relative to working_directory'
+    required: false
+    default: '.skyhook/skyhook.yaml'
+
+outputs:
+  # Service configuration
+  name:
+    description: 'Service name from config'
+    value: ${{ steps.parse.outputs.name }}
+  path:
+    description: 'Service path relative to repo root'
+    value: ${{ steps.parse.outputs.path }}
+  deployment_repo:
+    description: 'Separate deployment repository (if configured)'
+    value: ${{ steps.parse.outputs.deployment_repo }}
+  deployment_repo_path:
+    description: 'Path within deployment repository'
+    value: ${{ steps.parse.outputs.deployment_repo_path }}
+
+  # Build tool configuration
+  build_context:
+    description: 'Docker build context relative to repo root (defaults to "." when absent in config)'
+    value: ${{ steps.parse.outputs.build_context }}
+  dockerfile_path:
+    description: 'Dockerfile path relative to repo root'
+    value: ${{ steps.parse.outputs.dockerfile_path }}
+
+  # Status
+  config_found:
+    description: 'Whether the config file was found (true/false)'
+    value: ${{ steps.parse.outputs.config_found }}
+  service_found:
+    description: 'Whether the service was found in config (true/false)'
+    value: ${{ steps.parse.outputs.service_found }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install yq
+      shell: bash
+      run: |
+        if ! command -v yq &> /dev/null; then
+          echo "Installing yq..."
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+
+    - name: Parse skyhook config
+      id: parse
+      shell: bash
+      env:
+        WORKING_DIR: ${{ inputs.working_directory }}
+        SERVICE_NAME: ${{ inputs.service_name }}
+        CONFIG_PATH: ${{ inputs.config_path }}
+      run: |
+        CONFIG_FILE="${WORKING_DIR}/${CONFIG_PATH}"
+
+        # Check if config file exists
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "Config file not found: $CONFIG_FILE"
+          echo "config_found=false" >> $GITHUB_OUTPUT
+          echo "service_found=false" >> $GITHUB_OUTPUT
+          # Set empty outputs for all fields
+          echo "name=" >> $GITHUB_OUTPUT
+          echo "path=" >> $GITHUB_OUTPUT
+          echo "deployment_repo=" >> $GITHUB_OUTPUT
+          echo "deployment_repo_path=" >> $GITHUB_OUTPUT
+          echo "build_context=" >> $GITHUB_OUTPUT
+          echo "dockerfile_path=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "config_found=true" >> $GITHUB_OUTPUT
+        echo "Found config file: $CONFIG_FILE"
+
+        # Find the service by name in the services array
+        # Use yq to query the YAML
+        SERVICE_INDEX=$(yq e ".services | to_entries | .[] | select(.value.name == \"${SERVICE_NAME}\") | .key" "$CONFIG_FILE" 2>/dev/null || echo "")
+
+        if [ -z "$SERVICE_INDEX" ]; then
+          echo "Service '$SERVICE_NAME' not found in config"
+          echo "service_found=false" >> $GITHUB_OUTPUT
+          # Set empty outputs
+          echo "name=" >> $GITHUB_OUTPUT
+          echo "path=" >> $GITHUB_OUTPUT
+          echo "deployment_repo=" >> $GITHUB_OUTPUT
+          echo "deployment_repo_path=" >> $GITHUB_OUTPUT
+          echo "build_context=" >> $GITHUB_OUTPUT
+          echo "dockerfile_path=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "service_found=true" >> $GITHUB_OUTPUT
+        echo "Found service '$SERVICE_NAME' at index $SERVICE_INDEX"
+
+        # Extract service configuration
+        SERVICE_PATH=".services[$SERVICE_INDEX]"
+
+        # Get basic service fields
+        NAME=$(yq e "${SERVICE_PATH}.name // \"\"" "$CONFIG_FILE")
+        PATH_VALUE=$(yq e "${SERVICE_PATH}.path // \"\"" "$CONFIG_FILE")
+        DEPLOYMENT_REPO=$(yq e "${SERVICE_PATH}.deploymentRepo // \"\"" "$CONFIG_FILE")
+        DEPLOYMENT_REPO_PATH=$(yq e "${SERVICE_PATH}.deploymentRepoPath // \"\"" "$CONFIG_FILE")
+
+        # Get buildTool.docker configuration
+        BUILD_CONTEXT=$(yq e "${SERVICE_PATH}.buildTool.docker.buildContext // \"\"" "$CONFIG_FILE")
+        DOCKERFILE_PATH=$(yq e "${SERVICE_PATH}.buildTool.docker.dockerfilePath // \"\"" "$CONFIG_FILE")
+
+        # Handle "null" strings from yq
+        [ "$NAME" = "null" ] && NAME=""
+        [ "$PATH_VALUE" = "null" ] && PATH_VALUE=""
+        [ "$DEPLOYMENT_REPO" = "null" ] && DEPLOYMENT_REPO=""
+        [ "$DEPLOYMENT_REPO_PATH" = "null" ] && DEPLOYMENT_REPO_PATH=""
+        [ "$BUILD_CONTEXT" = "null" ] && BUILD_CONTEXT=""
+        [ "$DOCKERFILE_PATH" = "null" ] && DOCKERFILE_PATH=""
+
+        # Default build context to "." when absent
+        [ -z "$BUILD_CONTEXT" ] && BUILD_CONTEXT="."
+
+        # Output values
+        echo "name=${NAME}" >> $GITHUB_OUTPUT
+        echo "path=${PATH_VALUE}" >> $GITHUB_OUTPUT
+        echo "deployment_repo=${DEPLOYMENT_REPO}" >> $GITHUB_OUTPUT
+        echo "deployment_repo_path=${DEPLOYMENT_REPO_PATH}" >> $GITHUB_OUTPUT
+        echo "build_context=${BUILD_CONTEXT}" >> $GITHUB_OUTPUT
+        echo "dockerfile_path=${DOCKERFILE_PATH}" >> $GITHUB_OUTPUT
+
+        # Log outputs for debugging
+        echo "Parsed service configuration:"
+        echo "  name: ${NAME}"
+        echo "  path: ${PATH_VALUE}"
+        echo "  deployment_repo: ${DEPLOYMENT_REPO}"
+        echo "  deployment_repo_path: ${DEPLOYMENT_REPO_PATH}"
+        echo "  build_context: ${BUILD_CONTEXT}"
+        echo "  dockerfile_path: ${DOCKERFILE_PATH}"
+
+branding:
+  icon: 'file-text'
+  color: 'blue'
+
